@@ -117,9 +117,39 @@ transform_task = PythonOperator(
 )
 
 #### CREATE TABLE ####
+create_database_ddl = """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'astro') THEN
+            CREATE DATABASE astro;
+        END IF;
+    END
+    $$;
+"""
+
+create_database_postgres = PostgresOperator(
+    task_id='create_database_postgres',
+    postgres_conn_id='postgres_default',
+    sql=create_database_ddl,
+    autocommit=True,
+    dag=dag
+)
+
+create_schema_ddl = """
+    CREATE SCHEMA IF NOT EXISTS astro;
+"""
+
+create_schema_postgres = PostgresOperator(
+    task_id='create_schema_postgres',
+    postgres_conn_id='postgres_astro',
+    sql=create_schema_ddl,
+    autocommit=True,  # Garantir que a transação seja desativada
+    dag=dag
+)
+
 
 create_table_ddl = """
-    CREATE TABLE IF NOT EXISTS cotacoes (
+    CREATE TABLE IF NOT EXISTS astro.cotacoes (
         dt_fechamento DATE,
         cod_moeda TEXT,
         tipo_moeda TEXT,
@@ -144,14 +174,28 @@ create_table_postgres = PostgresOperator(
 
 def load(**kwargs):
     cotacoes_df = kwargs['ti'].xcom_pull(task_ids='transform')
-    table_name = "cotacoes"
+    table_name = "astro.cotacoes"  # Certifique-se de incluir o esquema
+    
+    postgres_hook = PostgresHook(postgres_conn_id='postgres_astro')
 
-    # A conexão com o banco já foi configurada com encoding UTF-8
-    postgres_hook = PostgresHook(postgres_conn_id='postgres_astro', schema="astro", options={'client_encoding': 'UTF8'})
+    # Verifique se a tabela existe
+    conn = postgres_hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = 'astro'
+            AND table_name = 'cotacoes'
+        );
+    """)
+    table_exists = cursor.fetchone()[0]
+    if not table_exists:
+        logging.error("Tabela 'cotacoes' não existe no esquema 'astro'.")
+        return
 
+    # Se a tabela existir, prossegue para inserir os dados
     rows = list(cotacoes_df.itertuples(index=False))
-
-    # Inserindo os dados no PostgreSQL
+    
     postgres_hook.insert_rows(
         table=table_name,
         rows=rows,
@@ -160,6 +204,7 @@ def load(**kwargs):
                        "data_processamento"]
     )
 
+
 load_task = PythonOperator(
     task_id='load',
     python_callable=load,
@@ -167,4 +212,4 @@ load_task = PythonOperator(
 )
 
 # Definindo a ordem das tarefas
-extract_task >> transform_task >> create_table_postgres >> load_task
+extract_task >> transform_task >> create_database_postgres >> create_schema_postgres>> create_table_postgres >> load_task
